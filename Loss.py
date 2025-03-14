@@ -3,200 +3,173 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import math
-# gid=0
+from typing import Optional, Tuple
+
+
 class Grad:
     """
-    N-D gradient loss.
+    N-D Gradient Loss for deformation field regularization.
+    Penalizes sudden changes in the displacement field.
     """
 
-    def __init__(self, penalty='l1', loss_mult=None):
+    def __init__(self, penalty: str = 'l1', loss_mult: Optional[float] = None) -> None:
+        """
+        Args:
+            penalty: Either 'l1' or 'l2' for different gradient loss types.
+            loss_mult: Optional multiplier for the loss.
+        """
         self.penalty = penalty
         self.loss_mult = loss_mult
 
-    def _diffs(self, y):
-        vol_shape = [n for n in y.shape][2:]
-        ndims = len(vol_shape)
+    def _compute_diffs(self, y_pred: torch.Tensor) -> list:
+        """
+        Compute differences along each spatial dimension.
+        """
+        ndims = len(y_pred.shape) - 2  # Excluding batch and channels
+        diffs = [y_pred.narrow(dim=i + 2, start=1, length=y_pred.shape[i + 2] - 1) -
+                 y_pred.narrow(dim=i + 2, start=0, length=y_pred.shape[i + 2] - 1)
+                 for i in range(ndims)]
+        return diffs
 
-        df = [None] * ndims
-        for i in range(ndims):
-            d = i + 2
-            # permute dimensions
-            r = [d, *range(0, d), *range(d + 1, ndims + 2)]
-            y = y.permute(r)
-            dfi = y[1:, ...] - y[:-1, ...]
+    def loss(self, y_pred: torch.Tensor) -> torch.Tensor:
+        """
+        Compute gradient regularization loss.
 
-            # permute back
-            # note: this might not be necessary for this loss specifically,
-            # since the results are just summed over anyway.
-            r = [*range(d - 1, d + 1), *reversed(range(1, d - 1)), 0, *range(d + 1, ndims + 2)]
-            df[i] = dfi.permute(r)
+        Args:
+            y_pred: Predicted deformation field.
 
-        return df
+        Returns:
+            Gradient loss.
+        """
+        diffs = self._compute_diffs(y_pred)
 
-    def loss(self,y_pred):
         if self.penalty == 'l1':
-            dif = [torch.abs(f) for f in self._diffs(y_pred)]
+            diffs = [torch.abs(d) for d in diffs]
+        elif self.penalty == 'l2':
+            diffs = [d ** 2 for d in diffs]
         else:
-            assert self.penalty == 'l2', 'penalty can only be l1 or l2. Got: %s' % self.penalty
-            dif = [f * f for f in self._diffs(y_pred)]
+            raise ValueError(f"Penalty must be 'l1' or 'l2', got {self.penalty}")
 
-        df = [torch.mean(torch.flatten(f, start_dim=1), dim=-1) for f in dif]
-        grad = sum(df) / len(df)
+        loss = sum(torch.mean(d) for d in diffs) / len(diffs)
+        return loss * self.loss_mult if self.loss_mult else loss
 
-        if self.loss_mult is not None:
-            grad *= self.loss_mult
-
-        return grad.mean()
-# 示例使用
-# loss_fn = Grad().loss
-# # deformation = torch.randn(1, 2, 256, 256)  # 假设形变场的大小为 (batch_size, 2, height, width)
-# img = torch.zeros(1, 2, 256, 256)  # 假设图像的大小为 (batch_size, 1, height, width)
-# #
-# loss =loss_fn(img)
-# print("Regularization Loss:", loss.item())
-import torch
-import torch.nn.functional as F
-import math
-import numpy as np
 
 class NCC:
     """
-    Local (over window) normalized cross correlation loss for multi-channel inputs.
+    Local Normalized Cross-Correlation (NCC) Loss for image similarity measurement.
     """
 
-    def __init__(self, win=None):
-        self.win = win
+    def __init__(self, win: Optional[int] = None) -> None:
+        """
+        Args:
+            win: Window size for local similarity computation.
+        """
+        self.win = win if win else 9  # Default window size of 9x9
 
-    def loss(self, y_true, y_pred):
-        # Ensure the inputs are floating point
-        y_true = y_true.float()
-        y_pred = y_pred.float()
+    def loss(self, y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
+        """
+        Compute NCC loss.
 
-        # Assume inputs are [batch_size, channels, H, W]
+        Args:
+            y_true: Ground truth image.
+            y_pred: Predicted image.
+
+        Returns:
+            NCC loss.
+        """
+        y_true, y_pred = y_true.float(), y_pred.float()
         batch_size, channels, H, W = y_true.shape
-        ndims = len(y_true.shape) - 2
-        assert ndims in [1, 2], "Volumes should be 1 or 2 dimensions. Found: %d" % ndims
+        ndims = 2  # 2D images
 
-        # Set window size
-        win = [9] * ndims if self.win is None else self.win
+        sum_filt = torch.ones((channels, 1, self.win, self.win), device=y_pred.device)
+        stride = (1, 1)
+        padding = (self.win // 2, self.win // 2)
 
-        # Create the convolution filter
-        # Using depthwise convolution (groups=channels) to apply the filter to each channel independently
-        sum_filt = torch.ones([channels, 1, *win], device=y_pred.device)
+        # Compute sums within window
+        I_sum = F.conv2d(y_true, sum_filt, stride=stride, padding=padding, groups=channels)
+        J_sum = F.conv2d(y_pred, sum_filt, stride=stride, padding=padding, groups=channels)
+        I2_sum = F.conv2d(y_true ** 2, sum_filt, stride=stride, padding=padding, groups=channels)
+        J2_sum = F.conv2d(y_pred ** 2, sum_filt, stride=stride, padding=padding, groups=channels)
+        IJ_sum = F.conv2d(y_true * y_pred, sum_filt, stride=stride, padding=padding, groups=channels)
 
-        pad_no = math.floor(win[0] / 2)
-
-        if ndims == 1:
-            stride = (1,)
-            padding = (pad_no,)
-            conv_fn = F.conv1d
-        elif ndims == 2:
-            stride = (1, 1)
-            padding = (pad_no, pad_no)
-            conv_fn = F.conv2d
-        else:
-            raise NotImplementedError("Only 1D and 2D NCC are implemented.")
-
-        # Compute squares and products
-        I2 = y_true * y_true
-        J2 = y_pred * y_pred
-        IJ = y_true * y_pred
-
-        # Sum within the window
-        I_sum = conv_fn(y_true, sum_filt, stride=stride, padding=padding, groups=channels)
-        J_sum = conv_fn(y_pred, sum_filt, stride=stride, padding=padding, groups=channels)
-        I2_sum = conv_fn(I2, sum_filt, stride=stride, padding=padding, groups=channels)
-        J2_sum = conv_fn(J2, sum_filt, stride=stride, padding=padding, groups=channels)
-        IJ_sum = conv_fn(IJ, sum_filt, stride=stride, padding=padding, groups=channels)
-
-        # Compute means
-        win_size = np.prod(win)
-        u_I = I_sum / win_size
-        u_J = J_sum / win_size
-
-        # Compute cross-correlation
+        win_size = self.win ** 2
+        u_I, u_J = I_sum / win_size, J_sum / win_size
         cross = IJ_sum - u_J * I_sum - u_I * J_sum + u_I * u_J * win_size
-        I_var = I2_sum - 2 * u_I * I_sum + u_I * u_I * win_size
-        J_var = J2_sum - 2 * u_J * J_sum + u_J * u_J * win_size
+        I_var = I2_sum - 2 * u_I * I_sum + u_I ** 2 * win_size
+        J_var = J2_sum - 2 * u_J * J_sum + u_J ** 2 * win_size
 
-        # Compute NCC
-        cc = cross * cross / (I_var * J_var + 1e-5)
-
-        # Average over all channels and batch
-        return -torch.mean(cc)
+        ncc = cross ** 2 / (I_var * J_var + 1e-6)  # Add small constant for numerical stability
+        return -torch.mean(ncc)
 
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-from torch.autograd import Variable
-
-class MutualInformation2D(torch.nn.Module):
+class MutualInformation2D(nn.Module):
     """
-    Mutual Information for 2D Images
-    Adapted for 2D images from VoxelMorph
+    Mutual Information Loss for 2D Images.
     """
 
-    def __init__(self, sigma_ratio=1, minval=0., maxval=1., num_bin=32,device="cuda:0"):
+    def __init__(self, sigma_ratio: float = 1, minval: float = 0., maxval: float = 1., num_bin: int = 32, device: str = "cuda:0") -> None:
+        """
+        Args:
+            sigma_ratio: Ratio for Gaussian kernel.
+            minval: Minimum value for intensity bins.
+            maxval: Maximum value for intensity bins.
+            num_bin: Number of bins for probability distribution.
+            device: Device for computations.
+        """
         super(MutualInformation2D, self).__init__()
 
-        """Create bin centers"""
-        bin_centers = np.linspace(minval, maxval, num=num_bin)
-        vol_bin_centers = Variable(torch.linspace(minval, maxval, num_bin), requires_grad=False).to(device)
-        num_bins = len(bin_centers)
-
-        """Sigma for Gaussian approx."""
-        sigma = np.mean(np.diff(bin_centers)) * sigma_ratio
-
-        self.preterm = 1 / (2 * sigma ** 2)
-        self.bin_centers = bin_centers
+        self.num_bins = num_bin
+        self.device = device
         self.max_clip = maxval
-        self.num_bins = num_bins
-        self.vol_bin_centers = vol_bin_centers
+        self.vol_bin_centers = torch.linspace(minval, maxval, num_bin, device=device)
+        sigma = np.mean(np.diff(self.vol_bin_centers.cpu().numpy())) * sigma_ratio
+        self.preterm = 1 / (2 * sigma ** 2)
 
-    def mi(self, y_true, y_pred):
-        # Clamp values to range
-        y_true=y_true*0.5+0.5
-        y_pred=y_pred*0.5+0.5
-        y_pred = torch.clamp(y_pred, 0., self.max_clip)
-        y_true = torch.clamp(y_true, 0., self.max_clip)
+    def _compute_probability(self, y: torch.Tensor) -> torch.Tensor:
+        """
+        Compute probability distribution over bins using a Gaussian model.
 
-        # Reshape images into 2D format and add a dimension for bin centers
-        y_true = y_true.reshape(y_true.shape[0], -1)
-        y_true = torch.unsqueeze(y_true, 2)
-        y_pred = y_pred.reshape(y_pred.shape[0], -1)
-        y_pred = torch.unsqueeze(y_pred, 2)
+        Args:
+            y: Input tensor.
 
-        nb_voxels = y_pred.shape[1]  # total num of voxels (pixels in this case)
+        Returns:
+            Probability tensor.
+        """
+        y = torch.clamp(y * 0.5 + 0.5, 0., self.max_clip)  # Normalize to [0,1]
+        y = y.view(y.shape[0], -1, 1)
+        bin_centers = self.vol_bin_centers.view(1, 1, -1)
+        prob = torch.exp(-self.preterm * (y - bin_centers) ** 2)
+        return prob / torch.sum(prob, dim=-1, keepdim=True)
 
-        """Reshape bin centers"""
-        o = [1, 1, np.prod(self.vol_bin_centers.shape)]
-        vbc = torch.reshape(self.vol_bin_centers, o).to(y_pred.device)
+    def forward(self, y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
+        """
+        Compute mutual information loss.
 
-        """compute image terms by approx. Gaussian dist."""
-        I_a = torch.exp(- self.preterm * torch.square(y_true - vbc))
-        I_a = I_a / torch.sum(I_a, dim=-1, keepdim=True)
+        Args:
+            y_true: Ground truth image.
+            y_pred: Predicted image.
 
-        I_b = torch.exp(- self.preterm * torch.square(y_pred - vbc))
-        I_b = I_b / torch.sum(I_b, dim=-1, keepdim=True)
-
-        # Compute joint probability pab and marginal probabilities pa, pb
-        pab = torch.bmm(I_a.permute(0, 2, 1), I_b)
-        pab = pab / nb_voxels
-        pa = torch.mean(I_a, dim=1, keepdim=True)
-        pb = torch.mean(I_b, dim=1, keepdim=True)
-
+        Returns:
+            Mutual information loss.
+        """
+        I_a = self._compute_probability(y_true)
+        I_b = self._compute_probability(y_pred)
+        pab = torch.bmm(I_a.permute(0, 2, 1), I_b) / y_true.shape[1]
+        pa, pb = torch.mean(I_a, dim=1, keepdim=True), torch.mean(I_b, dim=1, keepdim=True)
         papb = torch.bmm(pa.permute(0, 2, 1), pb) + 1e-6
-        mi = torch.sum(torch.sum(pab * torch.log(pab / papb + 1e-6), dim=1), dim=1)
-        return -mi.mean()  # average across batch
 
-    def forward(self, y_true, y_pred):
-        return self.mi(y_true, y_pred)
+        mi = torch.sum(pab * torch.log(pab / papb + 1e-6), dim=[1, 2])
+        return -mi.mean()
+
 
 if __name__ == '__main__':
-    x= torch.randn(1,2, 256, 256)  # 假设图像的大小为 (batch_size, 1, height, width)
-    y = torch.randn(1, 2, 256, 256)  # 假设图像的大小为 (batch_size, 1, height, width)
-    
-    pred=NCC().loss(x,x)
-    print(pred)
+    x = torch.randn(1, 1, 256, 256)  # Example input
+    y = torch.randn(1, 1, 256, 256)
+
+    grad_loss = Grad(penalty='l2').loss(x)
+    ncc_loss = NCC().loss(x, y)
+    mi_loss = MutualInformation2D().forward(x, y)
+
+    print(f"Gradient Loss: {grad_loss.item():.6f}")
+    print(f"NCC Loss: {ncc_loss.item():.6f}")
+    print(f"Mutual Information Loss: {mi_loss.item():.6f}")
